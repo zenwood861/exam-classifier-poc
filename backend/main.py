@@ -10,12 +10,19 @@ import fitz  # pymupdf
 import pandas as pd
 import pdfplumber
 from PIL import Image
+from pydantic import BaseModel
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+from classifier import (
+    classify_exercise as classify_vb_pn,
+    load_taxonomy_names as load_classifier_taxonomy,
+    detect_unit as rule_detect_unit,
+    detect_format as rule_detect_format,
+)
 
 load_dotenv()
 
@@ -88,6 +95,10 @@ def _load_one_taxonomy(lang: str, filename: str):
 def load_taxonomy():
     for lang, filename in TAXONOMY_FILES.items():
         _load_one_taxonomy(lang, filename)
+
+    classifier_excel = BASE_DIR / "english index table.xlsx"
+    if classifier_excel.exists():
+        load_classifier_taxonomy(str(classifier_excel))
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +197,198 @@ def detect_language(text: str) -> str:
     """Detect language from text. Returns 'CH' if Chinese chars dominate, else 'EN'."""
     chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
     return "CH" if chinese_chars > len(text) * 0.1 else "EN"
+
+
+# ---------------------------------------------------------------------------
+# Gemini-based exercise classification (VB/PN/SP taxonomy)
+# ---------------------------------------------------------------------------
+TAXONOMY_PROMPT = """
+You are classifying English grammar exercises for Primary 2-6 students.
+
+TAXONOMY (columns A, C, E, G, I):
+  A = "EN" (English)
+
+  C = Unit code:
+    VB = Verb Tense (verb FORM exercises — fill in correct tense/form)
+    PN = Pronouns (pronoun SUBSTITUTION exercises — fill in correct pronoun)
+    SP = Sentence Patterns (sentence TRANSFORMATION exercises — rewrite/convert/join)
+
+  DISAMBIGUATION RULES (critical — apply these BEFORE classifying):
+  - "Rewrite/convert/join/combine sentences" → SP (sentence transformation)
+  - "Fill in the blank with correct form/tense" → VB (verb morphology)
+  - "Fill in the blank with correct pronoun" → PN (pronoun substitution)
+  - Passive voice + rewrite/convert → SP S3, NOT VB S7
+  - Passive voice + fill in blank → VB S7, NOT SP S3
+  - Relative pronouns + join/combine sentences → SP S1, NOT PN
+  - Relative pronouns + fill in blank → PN, NOT SP S1
+  - Reported speech (direct↔indirect) → always SP S2
+  - Participle clauses/phrases → SP S4; gerund/infinitive form choice → VB S4
+  - Inversion with so/neither/negative adverbs → SP S5; regular if-conditionals → VB S3
+
+  VB sections (E):
+    1 = Agreement
+    2 = Verb Contraction
+    3 = Conditionals (G: 1=type 0, 2=type 1, 3=type 2, 10=mixed types)
+    4 = Gerund and Infinitives (G: 1=gerund, 2=to-infinitive, 3=both, 7=G+TI+BI mixed)
+    5 = Modals (G: 1=can, 5=ability, 7=request, 12=mixed)
+    6 = Tenses Actives:
+        G=1 present simple, G=2 present continuous, G=3 present+present cont,
+        G=4 past simple, G=5 present+past, G=6 present+present cont+past,
+        G=7 future (will), G=8 future (going to), G=9 future (will+going to),
+        G=12 present+past+future mixed, G=13 present perfect,
+        G=14 present perfect (just/already/yet), G=15 present perfect (ever/never),
+        G=17 present perfect+past, G=18 5-tense mix (present+cont+past+future+perfect),
+        G=19 past continuous, G=20 past cont+past, G=21 6-tense mix (+past cont),
+        G=22 past perfect, G=23 past perfect+past, G=25 all tenses,
+        G=27 present+past+future+present perfect+past cont+past perfect,
+        G=31 all tenses + conditionals
+    7 = Tenses Passive:
+        G=1 present, G=4 present cont, G=6 present+past, G=8 mixed passive, G=12 mixed
+
+  PN sections (E):
+    1 = Subject Pronouns (I, you, he, she, it, we, they)
+    2 = Object Pronouns (me, you, him, her, it, us, them)
+    3 = Possessive Adjectives (my, your, his, her, its, our, their)
+    4 = Possessive Pronouns (mine, yours, his, hers, ours, theirs)
+    5 = Reflexive Pronouns (myself, yourself, himself, herself, itself, ourselves, yourselves, themselves)
+    6 = Reciprocal (each other, one another)
+    7 = Indefinite (someone, anyone, everyone, nobody, something, etc.)
+    8 = Demonstratives (this, that, these, those)
+    9 = Mixed Pronouns (G: 1=subject+object, 2=+possessive adj, 3=+possessive pron, 4=+reflexive, 5=all)
+
+  SP sections (E):
+    1 = Relative Pronouns & Relative Clauses:
+        G=1 who+which, G=2 who+whom, G=3 who+whose, G=4 who+whom+which,
+        G=5 who+whom+whose, G=6 who+which+where, G=7 who+which+whose,
+        G=8 who+which+where+whose, G=9 mixed relative pronouns,
+        G=10 with preposition, G=11 mixed+with prep
+    2 = Reported Speech:
+        G=1 command, G=2 statement, G=3 question,
+        G=4 command+statement, G=5 statement+question,
+        G=6 command+statement+question, G=7 indirect→direct
+    3 = Passive Voice (sentence transformation):
+        G=1 present, G=2 present cont, G=3 present+present cont,
+        G=4 past, G=5 present+past, G=7 future (will),
+        G=12 present+cont+past+future, G=13 present perfect,
+        G=17 present perfect+past, G=18 5-tense mix,
+        G=19 past cont, G=20 past cont+past, G=21 6-tense mix,
+        G=22 past perfect, G=23 past perfect+past,
+        G=30 all tenses, G=31 question, G=32 conversion, G=33 causative+impersonal
+    4 = Participles:
+        G=1 feeling, G=2 cause and effect, G=3 active and passive,
+        G=4 feeling+cause+active/passive, G=5 perfect participles,
+        G=6 reduced relative clause, G=7 mixed
+    5 = Inversion:
+        G=1 so/neither, G=2 negative adverbs,
+        G=3 so/neither+negative adverbs, G=4 conditionals, G=5 mixed
+
+  I = Format code:
+    FB = Fill in the Blanks (no words given)
+    WB+FB = Word box + Fill in the Blanks (words provided to choose from)
+    MC = Multiple Choice / Circle the correct answer
+    SW = Sentence rewriting / Complete sentences
+    SQ = Short questions / Q&A
+    PR = Proofreading (find/correct errors)
+    MA = Matching
+
+  Grade estimation (for reference):
+    P2: present simple, present continuous, subject pronouns, object pronouns, basic possessive adj
+    P3: past simple, present+past, possessive adjectives in context
+    P4: future tense (will/going to), possessive pronouns, reflexive pronouns (basic), demonstratives, present+past+future mixed, relative pronouns (basic who/which)
+    P5: present perfect, past continuous, mixed 5+ tenses, reciprocal, indefinite pronouns, relative pronouns (advanced)
+    P6: conditionals, passive voice, gerund/infinitives, emphatic pronouns, mixed all tenses, reported speech, participles, inversion, passive rewriting
+"""
+
+def classify_exercise_with_gemini(exercise_title: str, question_texts: list[str]) -> dict:
+    """
+    Classify a single exercise using Gemini LLM + rule-based overrides.
+
+    Pipeline:
+      1. LLM classifies (unit, section E, LP G, grade, format) in one call
+      2. Rule overrides correct high-confidence signals (e.g. instruction says "pronoun" → PN)
+    """
+    if not gemini_client:
+        return {"error": "Gemini not configured"}
+
+    sample_qs = "\n".join(f"  Q{i+1}: {t}" for i, t in enumerate(question_texts[:8]))
+
+    prompt = f"""{TAXONOMY_PROMPT}
+
+Now classify this exercise:
+
+Exercise title/instruction: {exercise_title}
+Sample questions:
+{sample_qs}
+
+Think step by step:
+1. Is this an English exercise? If not, return language="NOT_EN"
+2. Is this about Verb Tense (VB), Pronouns (PN), or Sentence Patterns (SP)? Apply the disambiguation rules. If none, return unit="SKIP"
+3. Which section (E) and learning point (G) best matches?
+4. What is the exercise format (I)?
+5. What grade level (P2-P6) does this correspond to?
+
+Return JSON only (no markdown):
+{{"language": "EN or NOT_EN", "unit": "VB or PN or SP or SKIP", "E": number, "E_name": "section name", "G": number, "G_name": "learning point name", "format": "format code", "format_name": "format name", "grade": "P2-P6", "reasoning": "brief explanation"}}
+"""
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
+        parsed = json.loads(response.text)
+        # Gemini sometimes returns a list instead of a dict — unwrap it
+        result = parsed[0] if isinstance(parsed, list) else parsed
+    except Exception as e:
+        logger.error(f"Gemini classification error: {e}")
+        return {"error": str(e)}
+
+    # ── Rule-based overrides ──
+    # Only override when rules have high-confidence signals.
+    combined_text = " ".join(question_texts[:8])
+    overrides: list[str] = []
+
+    # Override 1: Unit detection — instruction explicitly says "pronoun" or "tense"
+    rule_unit = rule_detect_unit(exercise_title, combined_text)
+    llm_unit = result.get("unit")
+    if rule_unit and llm_unit != rule_unit:
+        instr_lower = exercise_title.lower()
+        # Only override if instruction has a strong explicit keyword
+        if rule_unit == "PN" and re.search(r"pronoun", instr_lower):
+            result["unit"] = "PN"
+            overrides.append(f"unit→PN (instruction says 'pronoun')")
+        elif rule_unit == "VB" and re.search(r"tense|verb|passive|conditional|gerund|infinitive|modal", instr_lower):
+            result["unit"] = "VB"
+            overrides.append(f"unit→VB (instruction says tense/verb keyword)")
+
+    # Override 2: Format detection — rule-based format is more reliable for clear patterns
+    rule_fmt = rule_detect_format(exercise_title, combined_text)
+    llm_fmt = result.get("format", "")
+    if rule_fmt and rule_fmt != llm_fmt:
+        instr_lower = exercise_title.lower()
+        # Override for high-confidence format signals
+        if "MC" in rule_fmt and re.search(r"circle|underline\s+the\s+correct|choose\s+the\s+correct", instr_lower):
+            result["format"] = rule_fmt
+            overrides.append(f"format→{rule_fmt} (circle/choose instruction)")
+        elif "WB+FB" in rule_fmt and re.search(r"word\s*(box|bank)|from\s+the\s+box|given\s+words", instr_lower):
+            result["format"] = rule_fmt
+            overrides.append(f"format→{rule_fmt} (word box detected)")
+        elif "PR" in rule_fmt and re.search(r"proofread|underlined\s+words?\s+are\s+wrong|correct\s+the\s+(mistake|error)", instr_lower):
+            result["format"] = rule_fmt
+            overrides.append(f"format→{rule_fmt} (proofreading instruction)")
+        elif "SW" in rule_fmt and re.search(r"rewrite|write\s+(the\s+)?sentence|change\s+.*?(active|passive)", instr_lower):
+            result["format"] = rule_fmt
+            overrides.append(f"format→{rule_fmt} (rewrite instruction)")
+
+    if overrides:
+        result["overrides"] = overrides
+        logger.info(f"Rule overrides applied: {overrides}")
+
+    return result
 
 
 def classify_by_keywords(text: str, exercise_title: str = "", lang: str = "EN") -> list[dict]:
@@ -289,33 +492,45 @@ Be thorough — do not skip any question."""
 Your job is to extract EVERY exercise and question on this page.
 
 Rules:
-- Each exercise has a title like "Exercise 1", "Exercise 2", "EXERCISE 3", "Ex. 4", etc.
+- Exercise labels come in MANY forms. Common patterns:
+  "B1 Fill in the blanks", "A2 Fill in the blanks with...", "Practice C Invite your friend...",
+  "D Finish the postcard...", "E. George wrote the diary...", "Look, read and write",
+  "Exercise 1", "Part A", etc.
+- The exercise label/ID (like B1, A2, Practice C, D, E) plus its instruction IS the exercise title
 - Under each exercise there are numbered questions — numbering restarts per exercise
 - Extract EVERY question — fill-in-the-blank, multiple choice, circle/underline, rewrite, matching, true/false, etc.
-- Include the blank markers (______) and answer options
-- Include any instructions as part of the exercise title
+- Include the blank markers (______) and answer options (e.g. "itself / themselves")
+- Include any word box (list of words to choose from) as part of the exercise title
 - If there are sub-questions (a, b, c), list each as a separate entry
-- IMPORTANT: If the page contains a reading passage/article (Reading Comprehension), set "has_passage" to true and include the passage text in "passage_text"
+- IMPORTANT: If the page contains a reading passage/article, set "has_passage" to true and include the passage text in "passage_text"
 
-For EACH question, also provide a bounding box [y_min, x_min, y_max, x_max] where coordinates are on a 0-1000 scale relative to the full page image. The box should tightly wrap the question text area.
+For EACH question, also provide a bounding box [y_min, x_min, y_max, x_max] where coordinates are on a 0-1000 scale relative to the full page image.
 
 Return JSON:
 {
   "exercises": [
     {
-      "exercise": "Exercise 1: Choose the correct pronoun",
+      "exercise": "B1 Fill in the blanks. (theirs his hers ours mine yours)",
       "has_passage": false,
       "passage_text": "",
       "questions": [
-        {"no": 1, "text": "She gave ______ the book. (I / me / my)", "bbox": [120, 50, 160, 950]},
-        {"no": 2, "text": "They enjoyed ______ at the party.", "bbox": [160, 50, 200, 950]}
+        {"no": 1, "text": "This is your cake. The cake is ______.", "bbox": [120, 50, 160, 950]},
+        {"no": 2, "text": "Shirley and Albert have a boat. The boat is ______.", "bbox": [160, 50, 200, 950]}
+      ]
+    },
+    {
+      "exercise": "B2 The underlined words are wrong. Write the correct words in the blanks.",
+      "has_passage": false,
+      "passage_text": "",
+      "questions": [
+        {"no": 1, "text": "That is Jenny's ring. It is theirs. ______", "bbox": [220, 50, 260, 950]}
       ]
     }
   ]
 }
 
 If NO exercises or questions found, return: {"exercises": []}
-Be thorough — do not skip any question."""
+Be thorough — do not skip any question or exercise."""
 
         response = gemini_client.models.generate_content(
             model="gemini-2.0-flash",
@@ -440,66 +655,41 @@ async def upload_exam(files: list[UploadFile] = File(...)):
         except Exception as e:
             logger.warning(f"[{pdf_label}] PDF→image failed: {e}")
 
-        # ── Step 2: Try text extraction (digital PDFs) + detect language ──
+        # ── Step 2: Detect language from text or filename ──
         questions: list[dict] = []
         all_text_for_lang = ""
         try:
             with pdfplumber.open(str(upload_path)) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
+                for page in pdf.pages:
                     text = page.extract_text() or ""
                     all_text_for_lang += text
-                    if text.strip():
-                        current_exercise = ""
-                        for line in text.split("\n"):
-                            # Match English or Chinese exercise headers
-                            ex_match = re.match(r"(?i)(exercise|ex\.?)\s*\d+.*", line.strip())
-                            if not ex_match:
-                                ex_match = re.match(r"^[一二三四五六七八九十]+[、．.].*", line.strip())
-                            if ex_match:
-                                current_exercise = line.strip()
-                                continue
-                            q_match = re.match(r"^(\d+)[\.\)、．]\s*(.+)", line.strip())
-                            if not q_match:
-                                q_match = re.match(r"^[（(](\d+)[)）]\s*(.+)", line.strip())
-                            if q_match:
-                                questions.append({
-                                    "no": int(q_match.group(1)),
-                                    "text": q_match.group(2).strip(),
-                                    "page": page_num,
-                                    "exercise": current_exercise,
-                                    "bbox": None,
-                                })
         except Exception as e:
             logger.warning(f"[{pdf_label}] pdfplumber error: {e}")
 
-        # Detect language from extracted text, filename hints, or defer to OCR
         if all_text_for_lang.strip():
             pdf_lang = detect_language(all_text_for_lang)
         elif re.search(r"(?i)(ch|chinese|中文|語文)", pdf_label):
             pdf_lang = "CH"
         else:
-            pdf_lang = None  # will detect after OCR
-        logger.info(f"[{pdf_label}] Pre-OCR language guess: {pdf_lang}")
+            pdf_lang = None
+        logger.info(f"[{pdf_label}] Language guess: {pdf_lang}")
 
-        # ── Step 3: Scanned PDF fallback — Gemini Vision OCR (PARALLEL) ──
-        if not questions:
-            logger.info(f"[{pdf_label}] No text — using Gemini Vision OCR ({len(page_image_paths)} pages in parallel)")
-            if not gemini_client:
-                continue
+        # ── Step 3: Always use Gemini Vision OCR for exercise extraction ──
+        logger.info(f"[{pdf_label}] Using Gemini Vision OCR ({len(page_image_paths)} pages in parallel)")
+        if not gemini_client:
+            continue
 
-            # If language unknown, OCR first page to detect it
-            if pdf_lang is None and page_image_paths:
-                first_qs = extract_questions_from_image(page_image_paths[0], 1, lang="CH")
-                if not first_qs:
-                    first_qs = extract_questions_from_image(page_image_paths[0], 1, lang="EN")
-                sample_text = " ".join(q.get("text", "") for q in first_qs)
-                pdf_lang = detect_language(sample_text)
-                logger.info(f"[{pdf_label}] Detected language from OCR: {pdf_lang}")
-                # Keep the first page results
-                questions.extend(first_qs)
-                remaining_pages = page_image_paths[1:]
-            else:
-                remaining_pages = page_image_paths
+        if pdf_lang is None and page_image_paths:
+            first_qs = extract_questions_from_image(page_image_paths[0], 1, lang="CH")
+            if not first_qs:
+                first_qs = extract_questions_from_image(page_image_paths[0], 1, lang="EN")
+            sample_text = " ".join(q.get("text", "") for q in first_qs)
+            pdf_lang = detect_language(sample_text)
+            logger.info(f"[{pdf_label}] Detected language from OCR: {pdf_lang}")
+            questions.extend(first_qs)
+            remaining_pages = page_image_paths[1:]
+        else:
+            remaining_pages = page_image_paths
 
             def _ocr_page(img_path: Path) -> list[dict]:
                 pn = int(img_path.stem.split("_page_")[1])
@@ -595,97 +785,90 @@ async def upload_exam(files: list[UploadFile] = File(...)):
                     q["_passage_group"] = ex
                     break
 
+        # ── Step 4: Group questions by exercise, classify per exercise with Gemini ──
+        from collections import OrderedDict
+        exercise_groups: OrderedDict[str, list[dict]] = OrderedDict()
         for q in questions:
-            global_id += 1
-            exercise = q.get("exercise") or ""
-            q_text = q.get("text") or ""
-            slots = classify_by_keywords(q_text, exercise, lang=pdf_lang)
+            ex_key = q.get("exercise") or "(untitled)"
+            exercise_groups.setdefault(ex_key, []).append(q)
 
-            # Crop question image if we have a bbox — but NOT for passage-based exercises
-            page_num = q["page"]
-            page_img = OUTPUT_DIR / f"{pdf_label}_page_{page_num}.png"
-            crop_file = None
-            is_passage_q = "_passage_group" in q
-            if q.get("bbox") and page_img.exists() and not is_passage_q:
-                crop_file = crop_question_image(page_img, q["bbox"], global_id, pdf_label)
+        # Classify all exercises in parallel with Gemini
+        ex_items = list(exercise_groups.items())
+        classifications = [None] * len(ex_items)
 
+        def _classify_ex(idx_title_qs):
+            idx, title, qs = idx_title_qs
+            q_texts = [q.get("text") or "" for q in qs]
+            return idx, classify_exercise_with_gemini(title, q_texts)
+
+        with ThreadPoolExecutor(max_workers=min(6, len(ex_items))) as pool:
+            futures = {pool.submit(_classify_ex, (i, t, qs)): i for i, (t, qs) in enumerate(ex_items)}
+            for future in as_completed(futures):
+                try:
+                    idx, result = future.result()
+                    classifications[idx] = result
+                except Exception as e:
+                    logger.error(f"Classification thread error: {e}")
+
+        for (ex_title, ex_questions), classification in zip(ex_items, classifications):
+            # Extract exercise number for labels
             ex_num = ""
-            ex_match = re.search(r"(\d+)", exercise)
+            ex_match = re.search(r"(\d+)", ex_title)
             if ex_match:
                 ex_num = f"Ex{ex_match.group(1)} "
             elif pdf_lang == "CH":
-                ch_num_match = re.search(r"[（(]?([一二三四五六七八九十]+)[)）、]", exercise)
+                ch_num_match = re.search(r"[（(]?([一二三四五六七八九十]+)[)）、]", ex_title)
                 if ch_num_match:
                     cn_map = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
                               "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
                     cn = ch_num_match.group(1)
                     ex_num = f"Ex{cn_map.get(cn, cn)} "
 
+            # Collect page images for this exercise
+            ex_pages = sorted(set(q["page"] for q in ex_questions))
+            page_urls = [f"/output/{pdf_label}_page_{p}.png" for p in ex_pages]
+
+            # Build question list for this exercise
+            q_list = []
+            for q in ex_questions:
+                global_id += 1
+                q_list.append({
+                    "id": global_id,
+                    "no": q.get("no") or 0,
+                    "label": f"{ex_num}Q{q.get('no') or 0}",
+                    "text": q.get("text") or "",
+                    "page": q["page"],
+                })
+
             all_questions.append({
-                "id": global_id,
-                "no": q.get("no") or 0,
-                "label": f"{ex_num}Q{q.get('no') or 0}",
-                "text": q_text,
-                "exercise": exercise,
-                "page": q["page"],
+                "exercise": ex_title,
                 "pdf": pdf_label,
                 "lang": pdf_lang,
-                "image_url": f"/output/{crop_file}" if crop_file else f"/output/{pdf_label}_page_{page_num}.png",
-                "full_page_url": f"/output/{pdf_label}_page_{page_num}.png",
-                "slots": slots,
-                "passage_group": q.get("_passage_group") if is_passage_q else None,
-                "passage_text": (q.get("passage_text") or "") if is_passage_q else "",
+                "page_urls": page_urls,
+                "classification": classification or {},
+                "questions": q_list,
             })
 
     if not all_questions:
         raise HTTPException(status_code=422, detail="No questions detected in any uploaded PDF")
 
-    # ── Build passage groups for the response ──
-    groups: list[dict] = []
-    grouped_ids: set[int] = set()
-    seen_groups: dict[str, dict] = {}
+    total_qs = sum(len(ex["questions"]) for ex in all_questions)
+    logger.info(f"Processed {total_qs} questions in {len(all_questions)} exercises from {len(files)} file(s)")
+    return {"exercises": all_questions}
 
-    for q in all_questions:
-        pg = q.get("passage_group")
-        if not pg:
-            continue
-        grouped_ids.add(q["id"])
-        if pg not in seen_groups:
-            # Collect all page images for this passage group
-            group_pages = sorted(set(
-                qq["page"] for qq in all_questions if qq.get("passage_group") == pg
-            ))
-            page_urls = [f"/output/{q['pdf']}_page_{p}.png" for p in group_pages]
 
-            # Classify the group as a whole using the exercise title + passage text
-            passage_text = q.get("passage_text", "")
-            group_slots = classify_by_keywords(passage_text, pg, lang=q["lang"])
+# ---------------------------------------------------------------------------
+# POST /classify-text  —  test classification with pasted text (no PDF needed)
+# ---------------------------------------------------------------------------
+class ClassifyTextRequest(BaseModel):
+    instruction: str
+    text: str = ""
 
-            seen_groups[pg] = {
-                "group_id": f"grp_{len(groups)+1}",
-                "exercise": pg,
-                "pdf": q["pdf"],
-                "lang": q["lang"],
-                "page_urls": page_urls,
-                "passage_text": passage_text[:500] if passage_text else "",
-                "slots": group_slots,
-                "questions": [],
-            }
-            groups.append(seen_groups[pg])
-
-        seen_groups[pg]["questions"].append({
-            "id": q["id"],
-            "no": q["no"],
-            "label": q["label"],
-            "text": q["text"],
-            "slots": q["slots"],
-        })
-
-    # Standalone questions (not in any passage group)
-    standalone = [q for q in all_questions if q["id"] not in grouped_ids]
-
-    logger.info(f"Processed {len(all_questions)} questions ({len(groups)} passage groups, {len(standalone)} standalone) from {len(files)} file(s)")
-    return {"questions": standalone, "groups": groups}
+@app.post("/classify-text")
+async def classify_text(req: ClassifyTextRequest):
+    """Test classification with pasted text - no PDF needed."""
+    result = classify_vb_pn(req.instruction, req.text)
+    return result
 
 
 @app.get("/")
