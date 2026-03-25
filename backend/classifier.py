@@ -1103,6 +1103,8 @@ def estimate_grade(unit: str, E: int, G: int, instruction: str, text: str) -> st
         return _grade_from_vb(E, G, combined)
     elif unit == "PN":
         return _grade_from_pn(E, G, combined, instr_lower)
+    elif unit == "SP":
+        return _grade_from_sp(E, G, combined)
     return None
 
 
@@ -1250,6 +1252,33 @@ def _grade_from_pn(E: int, G: int, text: str, instruction: str = "") -> str:
         return "P5"
 
     return "P4"  # default
+
+
+def _grade_from_sp(E: int, G: int, text: str) -> str:
+    """Grade estimation for SP exercises."""
+    if E == 1:  # Relative Pronouns & Clauses
+        # Basic who/which → P4; whom/whose → P5; with prep → P6
+        if G in (1, 2):  # who+which, who+whom
+            return "P4"
+        if G in (3, 4, 5, 6, 7, 8, 9):  # more complex combos
+            return "P5"
+        if G in (10, 11):  # with preposition
+            return "P6"
+        return "P5"  # default
+
+    if E == 2:  # Reported Speech
+        return "P6"
+
+    if E == 3:  # Passive Voice
+        return "P6"
+
+    if E == 4:  # Participles
+        return "P6"
+
+    if E == 5:  # Inversion
+        return "P6"
+
+    return "P6"  # default for SP
 
 
 # ============================================================
