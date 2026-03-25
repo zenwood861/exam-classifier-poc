@@ -139,6 +139,10 @@ UNIT_KEYWORDS_EN: dict[str, list[str]] = {
     "MS": ["proofread", "spelling", "punctuation", "capitalization", "cloze",
            "idiom", "riddle", "summary", "comprehension", "passage", "read",
            "rewrite", "correct", "error", "mistake", "fill in"],
+    "SP": ["rewrite", "convert", "reported speech", "direct speech", "indirect speech",
+           "join sentences", "combine sentences", "relative clause",
+           "inversion", "participle clause", "reduced clause",
+           "active to passive", "passive to active"],
     "PS": ["part of speech", "prefix", "suffix", "word box", "identify pos",
            "word class", "word form", "word family"],
 }
@@ -348,22 +352,54 @@ Return JSON only (no markdown):
         return {"error": str(e)}
 
     # ── Rule-based overrides ──
-    # Only override when rules have high-confidence signals.
+    # Format-aware: transformation instructions protect SP from being overridden
     combined_text = " ".join(question_texts[:8])
     overrides: list[str] = []
 
-    # Override 1: Unit detection — instruction explicitly says "pronoun" or "tense"
-    rule_unit = rule_detect_unit(exercise_title, combined_text)
+    instr_lower = exercise_title.lower()
     llm_unit = result.get("unit")
+
+    # Detect if instruction is a transformation task (SP territory)
+    is_transformation = bool(re.search(
+        r"rewrite|convert|change\s+.{0,20}(to|into)|join\s+.{0,20}sentence|combine\s+.{0,20}sentence|"
+        r"direct\s+.{0,10}indirect|indirect\s+.{0,10}direct|reported\s+speech|"
+        r"inversion|participle\s+clause",
+        instr_lower
+    ))
+
+    # Detect if instruction is a fill-in task (VB/PN territory)
+    is_fill_in = bool(re.search(
+        r"fill\s+in|complete\s+the\s+blank|circle\s+the\s+correct|choose\s+the\s+correct",
+        instr_lower
+    ))
+
+    rule_unit = rule_detect_unit(exercise_title, combined_text)
+
+    # Override 1: Unit detection — format-aware
     if rule_unit and llm_unit != rule_unit:
-        instr_lower = exercise_title.lower()
-        # Only override if instruction has a strong explicit keyword
-        if rule_unit == "PN" and re.search(r"pronoun", instr_lower):
-            result["unit"] = "PN"
-            overrides.append(f"unit→PN (instruction says 'pronoun')")
-        elif rule_unit == "VB" and re.search(r"tense|verb|passive|conditional|gerund|infinitive|modal", instr_lower):
-            result["unit"] = "VB"
-            overrides.append(f"unit→VB (instruction says tense/verb keyword)")
+        if is_transformation and llm_unit == "SP":
+            # Gemini says SP + instruction is transformation → trust Gemini, don't override
+            pass
+        elif is_transformation and rule_unit == "SP" and llm_unit != "SP":
+            # Rules say SP + instruction is transformation → override to SP
+            result["unit"] = "SP"
+            overrides.append(f"unit→SP (transformation instruction)")
+        elif is_fill_in:
+            # Fill-in exercise → trust rule-based VB/PN detection
+            if rule_unit == "PN" and re.search(r"pronoun", instr_lower):
+                result["unit"] = "PN"
+                overrides.append(f"unit→PN (fill-in + instruction says 'pronoun')")
+            elif rule_unit == "VB" and re.search(r"tense|verb|passive|conditional|gerund|infinitive|modal", instr_lower):
+                result["unit"] = "VB"
+                overrides.append(f"unit→VB (fill-in + instruction says tense/verb keyword)")
+        elif not is_transformation:
+            # Non-transformation, non-fill-in: use original override logic
+            if rule_unit == "PN" and re.search(r"pronoun", instr_lower):
+                result["unit"] = "PN"
+                overrides.append(f"unit→PN (instruction says 'pronoun')")
+            elif rule_unit == "VB" and re.search(r"tense|verb|passive|conditional|gerund|infinitive|modal", instr_lower):
+                result["unit"] = "VB"
+                overrides.append(f"unit→VB (instruction says tense/verb keyword)")
 
     # Override 2: Format detection — rule-based format is more reliable for clear patterns
     rule_fmt = rule_detect_format(exercise_title, combined_text)
