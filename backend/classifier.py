@@ -20,6 +20,7 @@ import pandas as pd
 
 _vb_lp_names: dict[tuple[int, int], str] = {}
 _pn_lp_names: dict[tuple[int, int], str] = {}
+_sp_lp_names: dict[tuple[int, int], str] = {}
 
 
 def load_taxonomy_names(excel_path: str) -> None:
@@ -32,7 +33,7 @@ def load_taxonomy_names(excel_path: str) -> None:
     Populates _vb_lp_names and _pn_lp_names with (E, G) -> H mappings.
     Only stores the first occurrence per (E, G) combo (the Excel has duplicate rows for each format).
     """
-    global _vb_lp_names, _pn_lp_names
+    global _vb_lp_names, _pn_lp_names, _sp_lp_names
 
     df = pd.read_excel(excel_path, header=None)
     # Skip header row
@@ -40,7 +41,7 @@ def load_taxonomy_names(excel_path: str) -> None:
 
     for _, row in df.iterrows():
         unit_code = row[2]
-        if unit_code not in ("VB", "PN"):
+        if unit_code not in ("VB", "PN", "SP"):
             continue
 
         try:
@@ -55,9 +56,12 @@ def load_taxonomy_names(excel_path: str) -> None:
         if unit_code == "VB":
             if key not in _vb_lp_names:
                 _vb_lp_names[key] = H
-        else:
+        elif unit_code == "PN":
             if key not in _pn_lp_names:
                 _pn_lp_names[key] = H
+        elif unit_code == "SP":
+            if key not in _sp_lp_names:
+                _sp_lp_names[key] = H
 
 
 # ============================================================
@@ -1327,7 +1331,7 @@ def classify_exercise(instruction: str, text: str) -> dict:
             "I": None, "J": None,
             "grade": None,
             "confidence": 0.7,
-            "reason": "Not VB or PN exercise",
+            "reason": "Not VB, PN, or SP exercise",
         }
 
     # Step 3: Format
@@ -1336,6 +1340,8 @@ def classify_exercise(instruction: str, text: str) -> dict:
     # Step 4: Section + Learning Point
     if unit == "VB":
         E, G = detect_vb_section_and_lp(instruction, text)
+    elif unit == "SP":
+        E, G = detect_sp_section_and_lp(instruction, text)
     else:
         E, G = detect_pn_section_and_lp(instruction, text)
 
@@ -1349,7 +1355,7 @@ def classify_exercise(instruction: str, text: str) -> dict:
     return {
         "language": "EN",
         "unit": unit,
-        "unit_name": "Verb Tense" if unit == "VB" else "Pronouns",
+        "unit_name": {"VB": "Verb Tense", "PN": "Pronouns", "SP": "Sentence Patterns"}.get(unit, unit),
         "E": E, "F": F,
         "G": G, "H": H,
         "I": fmt, "J": _format_name(fmt),
@@ -1385,6 +1391,14 @@ _PN_SECTIONS = {
     9: "Mixed Pronouns",
 }
 
+_SP_SECTIONS = {
+    1: "Relative Pronouns & Relative Clauses",
+    2: "Reported Speech",
+    3: "Passive Voice",
+    4: "Participles",
+    5: "Inversion",
+}
+
 _FORMAT_NAMES = {
     "MC": "Multiple choices",
     "FB": "Fill in the Blanks",
@@ -1402,6 +1416,8 @@ _FORMAT_NAMES = {
 def _section_name(unit: str, E: int) -> str:
     if unit == "VB":
         return _VB_SECTIONS.get(E, f"Section {E}")
+    if unit == "SP":
+        return _SP_SECTIONS.get(E, f"Section {E}")
     return _PN_SECTIONS.get(E, f"Section {E}")
 
 
@@ -1410,6 +1426,8 @@ def _lp_name(unit: str, E: int, G: int) -> str:
     key = (E, G)
     if unit == "VB":
         name = _vb_lp_names.get(key)
+    elif unit == "SP":
+        name = _sp_lp_names.get(key)
     else:
         name = _pn_lp_names.get(key)
     if name:
