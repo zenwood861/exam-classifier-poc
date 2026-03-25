@@ -876,6 +876,218 @@ def detect_pn_section_and_lp(instruction: str, text: str) -> tuple[int, int]:
 
 
 # ============================================================
+# 4c. SP SECTION (E) AND LEARNING POINT (G) DETECTION
+# ============================================================
+
+def detect_sp_section_and_lp(instruction: str, text: str) -> tuple[int, int]:
+    """
+    For SP unit, detect E (section) and G (learning point).
+    Returns (E, G).
+
+    Sections:
+      1 = Relative Pronouns & Relative Clauses
+      2 = Reported Speech
+      3 = Passive Voice (sentence transformation)
+      4 = Participles
+      5 = Inversion
+    """
+    instr_lower = instruction.lower()
+    combined = f"{instr_lower} {text.lower()}"
+
+    # --- E=2: Reported Speech ---
+    if re.search(r"reported\s+speech|direct\s+.{0,10}indirect|indirect\s+.{0,10}direct|she\s+said|he\s+said|asked\s+.{0,5}(if|whether)", combined):
+        return _detect_sp_reported_speech_g(instr_lower, text.lower())
+
+    # --- E=4: Participles (check before E=1 so "reduced relative clause" isn't caught as relative pronoun) ---
+    if re.search(r"participle|reduced\s+(relative\s+)?clause", combined):
+        return _detect_sp_participle_g(instr_lower, combined)
+
+    # --- E=1: Relative Pronouns & Clauses ---
+    if re.search(r"(join|combine)\s+.{0,20}(who|which|whom|whose|where|that|relative|sentence)", instr_lower) or \
+       re.search(r"relative\s+(pronoun|clause)", instr_lower) or \
+       re.search(r"rewrite\s+.{0,20}using\s+(who|which|whom|whose|where)", instr_lower):
+        return _detect_sp_relative_g(instr_lower, combined)
+
+    # --- E=3: Passive Voice ---
+    if re.search(r"(rewrite|convert|change)\s+.{0,30}(passive|active)", instr_lower) or \
+       re.search(r"passive\s+.{0,10}active|active\s+.{0,10}passive", instr_lower):
+        return _detect_sp_passive_g(instr_lower, combined)
+
+    # --- E=5: Inversion ---
+    if re.search(r"inversion|so\s+(do|does|did|am|is|are|was|were|have|has|had|can|will|would)\s+\w+|neither\s+(do|does|did|am|is|are|was|were|have|has|had|can|will|would)\s+\w+", combined):
+        return _detect_sp_inversion_g(combined)
+
+    # Default: passive voice (most common SP)
+    return (3, 0)
+
+
+def _detect_sp_reported_speech_g(instruction: str, text: str) -> tuple[int, int]:
+    """Detect reported speech G value."""
+    # Indirect → direct (reverse direction)
+    if re.search(r"indirect\s+.{0,10}direct|reported\s+.{0,10}direct", instruction):
+        return (2, 7)
+
+    # Detect from text content
+    has_command = bool(re.search(r'"\s*(close|open|sit|stand|stop|don\'t|do\s+not|come|go|bring|take|give|put|clean|wash|finish|be\s+quiet)\b', text, re.IGNORECASE))
+    has_question = bool(re.search(r'"\s*(where|when|what|who|how|why|do\s+you|did\s+you|are\s+you|is\s+there|can\s+you|will\s+you|have\s+you)\b.*\?"', text, re.IGNORECASE))
+    has_statement = bool(re.search(r'(?:^|[\s(])"\s*(i\s+(am|was|have|had|will|like|love|want|need|think)|she\s+\w+|he\s+\w+|we\s+\w+|they\s+\w+|it\s+is|there\s+is)\b', text, re.IGNORECASE))
+
+    types = sum([has_command, has_question, has_statement])
+    if types >= 3:
+        return (2, 6)  # command+statement+question
+    if has_command and has_statement:
+        return (2, 4)  # command+statement
+    if has_statement and has_question:
+        return (2, 5)  # statement+question
+    if has_command:
+        return (2, 1)
+    if has_statement:
+        return (2, 2)
+    if has_question:
+        return (2, 3)
+    return (2, 2)  # default statement
+
+
+def _detect_sp_relative_g(instruction: str, combined: str) -> tuple[int, int]:
+    """Detect relative pronoun G value based on which pronouns are mentioned."""
+    has_who = bool(re.search(r"\bwho\b", combined))
+    has_which = bool(re.search(r"\bwhich\b", combined))
+    has_whom = bool(re.search(r"\bwhom\b", combined))
+    has_whose = bool(re.search(r"\bwhose\b", combined))
+    has_where = bool(re.search(r"\bwhere\b", combined))
+    has_prep = bool(re.search(r"\bwith\s+prep|prepositional|in\s+which|at\s+which|for\s+which|to\s+which", combined))
+
+    # With preposition combos
+    if has_prep:
+        if has_who or has_which or has_whom:
+            return (1, 11)  # mixed + with prep
+        return (1, 10)  # with prep only
+
+    # Count pronouns mentioned
+    pronouns = [has_who, has_which, has_whom, has_whose, has_where]
+    count = sum(pronouns)
+
+    if count >= 4:
+        return (1, 9)  # mixed
+
+    # Specific combos
+    if has_who and has_which and has_where and has_whose:
+        return (1, 8)
+    if has_who and has_which and has_whose:
+        return (1, 7)
+    if has_who and has_which and has_where:
+        return (1, 6)
+    if has_who and has_whom and has_whose:
+        return (1, 5)
+    if has_who and has_whom and has_which:
+        return (1, 4)
+    if has_who and has_whose:
+        return (1, 3)
+    if has_who and has_whom:
+        return (1, 2)
+    if has_who and has_which:
+        return (1, 1)
+
+    if count >= 2:
+        return (1, 9)  # mixed
+    return (1, 9)  # default mixed (can't tell from instruction alone)
+
+
+def _detect_sp_passive_g(instruction: str, combined: str) -> tuple[int, int]:
+    """Detect SP passive voice G value — maps to SP's 33 G values."""
+    # Check for explicit conversion exercise
+    if re.search(r"(active\s+to\s+passive\s+.{0,10}passive\s+to\s+active|passive\s+to\s+active\s+.{0,10}active\s+to\s+passive|change\s+.{0,10}(active|passive)\s+.{0,10}(active|passive))", instruction):
+        return (3, 32)  # conversion
+
+    if re.search(r"question", instruction):
+        return (3, 31)  # question forms
+
+    # Detect tenses in text to map to G
+    _IRR_PP = r"(known|called|spoken|written|seen|done|given|taken|made|eaten|driven|drawn|chosen|broken|stolen|worn|torn|born|shown|thrown|grown|blown|flown|frozen|hidden|ridden|risen|shaken|woken|forgotten|bitten|beaten)"
+    has_present = bool(re.search(r"\b(is|are)\s+\w+ed\b|\b(is|are)\s+made\b|\b(is|are)\s+" + _IRR_PP + r"\b", combined)) or \
+                  bool(re.search(r"\b(marks?|makes?|builds?|writes?|eats?|cleans?|washes?|reads?|gives?|takes?|plays?)\b", combined) and not re.search(r"\b(was|were|had|did)\b", combined))
+    has_past = bool(re.search(r"\b(was|were)\s+\w+ed\b|\b(was|were)\s+" + _IRR_PP + r"\b", combined)) or \
+               bool(re.search(r"\b(chased|opened|closed|finished|watched|cleaned|washed|cooked|built|wrote|ate|gave|took|made|broke|stole|drove|drew|chose)\b", combined))
+    has_future = bool(re.search(r"\bwill\s+be\s+\w+ed\b|\bwill\s+be\s+" + _IRR_PP + r"\b", combined))
+    has_present_cont = bool(re.search(r"\b(is|are)\s+being\s+\w+", combined))
+    has_past_cont = bool(re.search(r"\b(was|were)\s+being\s+\w+", combined))
+    has_present_perfect = bool(re.search(r"\b(has|have)\s+been\s+\w+ed\b|\b(has|have)\s+been\s+" + _IRR_PP + r"\b", combined))
+    has_past_perfect = bool(re.search(r"\bhad\s+been\s+\w+ed\b|\bhad\s+been\s+" + _IRR_PP + r"\b", combined))
+
+    flags = [has_present, has_past, has_future, has_present_cont, has_past_cont, has_present_perfect, has_past_perfect]
+    count = sum(flags)
+
+    if count >= 5:
+        return (3, 30)  # all tenses
+    if has_present and has_present_cont and has_past and has_future and has_present_perfect and has_past_cont:
+        return (3, 21)
+    if has_present and has_present_cont and has_past and has_future and has_present_perfect:
+        return (3, 18)
+    if has_present and has_present_cont and has_past and has_future:
+        return (3, 12)
+    if has_present_perfect and has_past:
+        return (3, 17)
+    if has_past_perfect and has_past:
+        return (3, 23)
+    if has_past_cont and has_past:
+        return (3, 20)
+    if has_present and has_past:
+        return (3, 5)
+    if has_present and has_present_cont:
+        return (3, 3)
+    if has_present_cont:
+        return (3, 2)
+    if has_past_cont:
+        return (3, 19)
+    if has_past_perfect:
+        return (3, 22)
+    if has_present_perfect:
+        return (3, 13)
+    if has_future:
+        return (3, 7)
+    if has_past:
+        return (3, 4)
+    if has_present:
+        return (3, 1)
+    return (3, 0)  # Others
+
+
+def _detect_sp_participle_g(instruction: str, combined: str) -> tuple[int, int]:
+    """Detect SP participle G value."""
+    if re.search(r"reduced\s+(relative\s+)?clause", combined):
+        return (4, 6)  # reduced relative clause
+    if re.search(r"perfect\s+participle", combined):
+        return (4, 5)  # perfect participles
+    if re.search(r"feeling|\bbore[d]?\b|\bboring\b|\bexcite[d]?\b|\bexciting\b|\binterest(ed|ing)?\b|\btire[d]?\b|\btiring\b|\bamaze[d]?\b|\bamazing\b", combined):
+        if re.search(r"cause|effect|result", combined):
+            return (4, 2)  # cause and effect
+        return (4, 1)  # feeling
+    if re.search(r"active\s+.{0,10}passive|passive\s+.{0,10}active", combined):
+        return (4, 3)  # active and passive participles
+    if re.search(r"cause\s+.{0,10}effect|effect\s+.{0,10}cause", combined):
+        return (4, 2)  # cause and effect
+    return (4, 7)  # mixed
+
+
+def _detect_sp_inversion_g(combined: str) -> tuple[int, int]:
+    """Detect SP inversion G value."""
+    has_so_neither = bool(re.search(r"\bso\s+(do|does|did|am|is|are|was|were|have|has|had|can|will|would)\b|\bneither\s+(do|does|did|am|is|are|was|were|have|has|had|can|will|would)\b", combined))
+    has_negative_adv = bool(re.search(r"\b(never|rarely|seldom|hardly|barely|no\s+sooner|not\s+only|at\s+no\s+time|on\s+no\s+account|under\s+no\s+circumstances)\b", combined))
+    has_conditional = bool(re.search(r"\b(had\s+I|were\s+I|should\s+you|had\s+he|were\s+he|had\s+she|were\s+she|had\s+they|were\s+they)\b", combined))
+
+    types = sum([has_so_neither, has_negative_adv, has_conditional])
+    if types >= 2:
+        return (5, 5)  # mixed
+    if has_conditional:
+        return (5, 4)
+    if has_negative_adv:
+        return (5, 2)
+    if has_so_neither:
+        return (5, 1)
+    return (5, 5)  # default mixed
+
+
+# ============================================================
 # 5. GRADE ESTIMATION
 # ============================================================
 
